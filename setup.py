@@ -22,10 +22,11 @@ setup(
         'rotary-embedding-torch',
         'sacremoses',
         'sentencepiece',
-        'torch>=1.10',
+        'torch==2.8.0', #[Foster]
         'torchvision',
         'transformers[torch]',
-        'tqdm'
+        'tqdm',
+        'numpy'
     ],
     classifiers=[
         'Development Status :: 4 - Beta',

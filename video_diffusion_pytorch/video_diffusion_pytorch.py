@@ -9,7 +9,7 @@ from torch.utils import data
 from pathlib import Path
 from torch.optim import Adam
 from torchvision import transforms as T, utils
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from PIL import Image
 
 from tqdm import tqdm
@@ -19,6 +19,10 @@ from einops_exts import check_shape, rearrange_many
 from rotary_embedding_torch import RotaryEmbedding
 
 from video_diffusion_pytorch.text import tokenize, bert_embed, BERT_MODEL_DIM
+
+import cv2
+
+import pdb
 
 # helpers functions
 
@@ -771,6 +775,17 @@ def seek_all_images(img, channels = 3):
             break
         i += 1
 
+#[Foster]
+def collate_ignore_nones(batch):
+    batch = [item for item in batch if item is not None]
+    
+    if len(batch) == 0:
+        return None
+    
+    return torch.stack(batch)
+
+
+
 # tensor of shape (channels, frames, height, width) -> gif
 
 def video_tensor_to_gif(tensor, path, duration = 120, loop = 0, optimize = True):
@@ -780,6 +795,36 @@ def video_tensor_to_gif(tensor, path, duration = 120, loop = 0, optimize = True)
     return images
 
 # gif -> (channels, frame, height, width) tensor
+
+def mp4_to_tensor(path, channels=3, transform=T.ToTensor(), frame_skip=1):
+    cap = cv2.VideoCapture(path)
+    frames = []
+
+    frame_num=0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_num % frame_skip == 0:
+            if channels == 3:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            elif channels == 1:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            img = Image.fromarray(frame)
+            tensor = transform(img)
+            frames.append(tensor)
+
+        frame_num += 1
+
+    cap.release()
+
+    if not frames:
+        with open('corrupted_files.txt', 'a') as f:
+            f.write(f"{path}\n")
+        raise ValueError(f"No frames found in {path}. Corrupted file?")
+
+    return torch.stack(frames, dim=1)  # (C, T, H, W)
 
 def gif_to_tensor(path, channels = 3, transform = T.ToTensor()):
     img = Image.open(path)
@@ -815,7 +860,7 @@ class Dataset(data.Dataset):
         num_frames = 16,
         horizontal_flip = False,
         force_num_frames = True,
-        exts = ['gif']
+        exts = ['gif', 'mp4']
     ):
         super().__init__()
         self.folder = folder
@@ -837,8 +882,18 @@ class Dataset(data.Dataset):
 
     def __getitem__(self, index):
         path = self.paths[index]
-        tensor = gif_to_tensor(path, self.channels, transform = self.transform)
-        return self.cast_num_frames_fn(tensor)
+        ext = Path(path).suffix
+        try:
+            if ext == '.mp4':
+                tensor = mp4_to_tensor(path, self.channels, transform=self.transform)
+            elif ext == '.gif':
+                tensor = gif_to_tensor(path, self.channels, transform = self.transform)
+            else:
+                exit(1)
+            return self.cast_num_frames_fn(tensor)
+        except ValueError:
+            print("Dataset encountered corrupted file.")
+            return None
 
 # trainer class
 
@@ -885,13 +940,13 @@ class Trainer(object):
         print(f'found {len(self.ds)} videos as gif files at {folder}')
         assert len(self.ds) > 0, 'need to have at least 1 video to start training (although 1 is not great, try 100k)'
 
-        self.dl = cycle(data.DataLoader(self.ds, batch_size = train_batch_size, shuffle=True, pin_memory=True))
+        self.dl = cycle(data.DataLoader(self.ds, batch_size = train_batch_size, collate_fn=collate_ignore_nones, shuffle=True, pin_memory=True))
         self.opt = Adam(diffusion_model.parameters(), lr = train_lr)
 
         self.step = 0
 
         self.amp = amp
-        self.scaler = GradScaler(enabled = amp)
+        self.scaler = GradScaler('cuda', enabled = amp)
         self.max_grad_norm = max_grad_norm
 
         self.num_sample_rows = num_sample_rows
@@ -931,6 +986,41 @@ class Trainer(object):
         self.ema_model.load_state_dict(data['ema'], **kwargs)
         self.scaler.load_state_dict(data['scaler'])
 
+    def gen_example_gif(self, video_tensor):
+
+        # Add noise to the video (forward diffusion) using q_sample
+        t = torch.randint(0, self.model.num_timesteps, (video_tensor.shape[0],), device=video_tensor.device).long()  # Random timestep
+        noisy_video = self.model.q_sample(video_tensor, t)
+
+        # Reverse diffusion (denoising) - Apply p_sample iteratively
+        with torch.no_grad():
+            denoised_video = noisy_video.clone()  # Start with the noisy video as the initial state
+        for timestep in tqdm(reversed(range(self.model.num_timesteps)), desc="Denoising"):
+            denoised_video = model.p_sample(denoised_video, torch.full((video_tensor.shape[0],), timestep, device=video_tensor.device).long())
+
+        video_tensor_to_gif(video_tensor, "prenoise.gif")
+        video_tensor_to_gif(noisy_video, "noised.gif")
+        video_tensor_to_gif(denoised_video, "denoised.gif")
+
+
+        milestone = self.step // self.save_and_sample_every
+        #num_samples = self.num_sample_rows ** 2
+        num_samples=1
+        batches = num_to_groups(num_samples, self.batch_size)
+
+        all_videos_list = list(map(lambda n: self.ema_model.sample(batch_size=n), batches))
+        all_videos_list = torch.cat(all_videos_list, dim = 0)
+
+        all_videos_list = F.pad(all_videos_list, (2, 2, 2, 2))
+
+        original_videos = all_videos_list.clone()
+
+        one_gif = rearrange(all_videos_list, '(i j) c f h w -> c f (i h) (j w)', i = self.num_sample_rows)
+        video_path = str(self.results_folder / str(f'{milestone}.gif'))
+        orig_video_path = str(self.results_folder / str(f'{milestone}-orginal.gif'))
+        video_tensor_to_gif(one_gif, video_path)
+        video_tensor_to_gif(one_gif, orig_video_path)
+
     def train(
         self,
         prob_focus_present = 0.,
@@ -941,9 +1031,15 @@ class Trainer(object):
 
         while self.step < self.train_num_steps:
             for i in range(self.gradient_accumulate_every):
-                data = next(self.dl).cuda()
+                torch.cuda.empty_cache()
 
-                with autocast(enabled = self.amp):
+                #[Foster] ignore any corrupted batches.
+                data = None
+                while(data == None):
+                    data = next(self.dl)
+                data = data.cuda()
+
+                with autocast('cuda', enabled = self.amp):
                     loss = self.model(
                         data,
                         prob_focus_present = prob_focus_present,
@@ -977,9 +1073,13 @@ class Trainer(object):
 
                 all_videos_list = F.pad(all_videos_list, (2, 2, 2, 2))
 
+                original_videos = all_videos_list.clone()
+
                 one_gif = rearrange(all_videos_list, '(i j) c f h w -> c f (i h) (j w)', i = self.num_sample_rows)
                 video_path = str(self.results_folder / str(f'{milestone}.gif'))
+                orig_video_path = str(self.results_folder / str(f'{milestone}-orginal.gif'))
                 video_tensor_to_gif(one_gif, video_path)
+                video_tensor_to_gif(one_gif, orig_video_path)
                 log = {**log, 'sample': video_path}
                 self.save(milestone)
 
