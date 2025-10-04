@@ -1002,25 +1002,6 @@ class Trainer(object):
         video_tensor_to_gif(noisy_video, "noised.gif")
         video_tensor_to_gif(denoised_video, "denoised.gif")
 
-
-        milestone = self.step // self.save_and_sample_every
-        #num_samples = self.num_sample_rows ** 2
-        num_samples=1
-        batches = num_to_groups(num_samples, self.batch_size)
-
-        all_videos_list = list(map(lambda n: self.ema_model.sample(batch_size=n), batches))
-        all_videos_list = torch.cat(all_videos_list, dim = 0)
-
-        all_videos_list = F.pad(all_videos_list, (2, 2, 2, 2))
-
-        original_videos = all_videos_list.clone()
-
-        one_gif = rearrange(all_videos_list, '(i j) c f h w -> c f (i h) (j w)', i = self.num_sample_rows)
-        video_path = str(self.results_folder / str(f'{milestone}.gif'))
-        orig_video_path = str(self.results_folder / str(f'{milestone}-orginal.gif'))
-        video_tensor_to_gif(one_gif, video_path)
-        video_tensor_to_gif(one_gif, orig_video_path)
-
     def train(
         self,
         prob_focus_present = 0.,
