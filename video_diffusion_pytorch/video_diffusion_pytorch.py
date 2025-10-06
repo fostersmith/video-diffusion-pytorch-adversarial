@@ -678,6 +678,18 @@ class GaussianDiffusion(nn.Module):
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     @torch.inference_mode()
+    def p_sample_loop_from(self, img, cond = None, cond_scale = 1.):
+        shape=img.shape
+        device = self.betas.device
+
+        b = shape[0]
+
+        for i in tqdm(reversed(range(0, self.num_timesteps)), desc='denoising', total=self.num_timesteps):
+            img = self.p_sample(img, torch.full((b,), i, device=device, dtype=torch.long), cond = cond, cond_scale = cond_scale)
+
+        return unnormalize_img(img)
+
+    @torch.inference_mode()
     def p_sample_loop(self, shape, cond = None, cond_scale = 1.):
         device = self.betas.device
 
@@ -986,21 +998,31 @@ class Trainer(object):
         self.ema_model.load_state_dict(data['ema'], **kwargs)
         self.scaler.load_state_dict(data['scaler'])
 
-    def gen_example_gif(self, video_tensor):
-
+    def gen_example_gif(self):
+        video_tensor = next(self.dl).cuda()
+        video_tensor_to_gif(video_tensor[0], "prenoise.gif")
         # Add noise to the video (forward diffusion) using q_sample
         t = torch.randint(0, self.model.num_timesteps, (video_tensor.shape[0],), device=video_tensor.device).long()  # Random timestep
+
         noisy_video = self.model.q_sample(video_tensor, t)
+
+        video_tensor_to_gif(noisy_video[0], "noised.gif")
 
         # Reverse diffusion (denoising) - Apply p_sample iteratively
         with torch.no_grad():
             denoised_video = noisy_video.clone()  # Start with the noisy video as the initial state
-        for timestep in tqdm(reversed(range(self.model.num_timesteps)), desc="Denoising"):
-            denoised_video = model.p_sample(denoised_video, torch.full((video_tensor.shape[0],), timestep, device=video_tensor.device).long())
 
-        video_tensor_to_gif(video_tensor, "prenoise.gif")
-        video_tensor_to_gif(noisy_video, "noised.gif")
-        video_tensor_to_gif(denoised_video, "denoised.gif")
+        denoised_video = self.model.p_sample_loop(denoised_video.shape)
+        
+        #denoised_video = self.model.p_sample(denoised_video, torch.full((video_tensor.shape[0],), 0, device=video_tensor.device).long())
+        #video_tensor_to_gif(denoised_video[0], "denoised-once.gif")
+
+        #for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
+        #    denoised_video = self.model.p_sample(denoised_video, torch.full((b,), i, device=video_tensor.device, dtype=torch.long), cond = None, cond_scale = 1.)
+        #for timestep in tqdm(reversed(range(self.model.num_timesteps)), desc="Denoising"):
+        #    denoised_video = self.model.p_sample(denoised_video, torch.full((video_tensor.shape[0],), timestep, device=video_tensor.device).long())
+        
+        video_tensor_to_gif(denoised_video[0], "denoised.gif")
 
     def train(
         self,
