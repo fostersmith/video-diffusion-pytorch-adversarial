@@ -24,6 +24,8 @@ import cv2
 
 import pdb
 
+import csv
+
 # helpers functions
 
 def exists(x):
@@ -766,6 +768,13 @@ class GaussianDiffusion(nn.Module):
         x = normalize_img(x)
         return self.p_losses(x, t, *args, **kwargs)
 
+    def forward_with_t(self, x, tval, *args, **kwargs):
+        b, device, img_size, = x.shape[0], x.device, self.image_size
+        check_shape(x, 'b c f h w', c = self.channels, f = self.num_frames, h = img_size, w = img_size)
+        t = torch.full((b,), tval, device=device).long()
+        x = normalize_img(x)
+        return self.p_losses(x, t, *args, **kwargs)
+
 # trainer class
 
 CHANNELS_TO_MODE = {
@@ -1023,6 +1032,44 @@ class Trainer(object):
         #    denoised_video = self.model.p_sample(denoised_video, torch.full((video_tensor.shape[0],), timestep, device=video_tensor.device).long())
         
         video_tensor_to_gif(denoised_video[0], "denoised.gif")
+
+    def evaluate_tvals(
+        self, 
+        num_steps,
+        t_min,
+        t_max,
+        t_step,
+        steps_per_t,
+        log_file='t_eval.json',
+        prob_focus_present = 0.,
+        focus_present_mask
+    ):
+        for tval in range(t_min,t_max,t_step):
+            loss_list=[]
+            for step in range(0, steps_per_t):
+                torch.cuda.empty_cache()
+
+                #[Foster] ignore any corrupted batches.
+                data = None
+                while(data == None):
+                    data = next(self.dl)
+                data = data.cuda()
+
+                with autocast('cuda', enabled = self.amp):
+                    loss = self.model.forward_with_t(
+                        data,
+                        tval,
+                        prob_focus_present = prob_focus_present,
+                        focus_present_mask = focus_present_mask
+                    )
+
+                print(f't:{tval} step:{step}: {loss.item()}')
+                loss_list.append(loss.item())
+            with open(log_file, 'wa', newline='') as csvfile:
+                writer=csv.writer(csvfile)
+                writer.write_row([tval] + loss_list)
+
+
 
     def train(
         self,
