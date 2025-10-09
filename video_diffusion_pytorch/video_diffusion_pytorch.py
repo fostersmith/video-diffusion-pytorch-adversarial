@@ -740,17 +740,28 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, cond = None, noise = None, **kwargs):
+    def p_losses(self, x_start, t, cond = None, noise = None, image_name=None, **kwargs):
         b, c, f, h, w, device = *x_start.shape, x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
 
+        if image_name != None:
+            video_tensor_to_gif(x_start[0], f"{image_name}-input.gif")
+
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
+
+        if image_name != None:
+            video_tensor_to_gif(x_noisy[0], f"{image_name}-noisy.gif")
 
         if is_list_str(cond):
             cond = bert_embed(tokenize(cond), return_cls_repr = self.text_use_bert_cls)
             cond = cond.to(device)
 
         x_recon = self.denoise_fn(x_noisy, t, cond = cond, **kwargs)
+
+        if image_name != None:
+            p_denoised = self.p_sample(x_start, t, noise=x_recon)
+            video_tensor_to_gif(q_denoised[0], f"{image_name}-psampled.gif")
+            video_tensor_to_gif(x_recon[0], f"{image_name}-recon.gif")
 
         if self.loss_type == 'l1':
             loss = F.l1_loss(noise, x_recon)
@@ -768,12 +779,12 @@ class GaussianDiffusion(nn.Module):
         x = normalize_img(x)
         return self.p_losses(x, t, *args, **kwargs)
 
-    def forward_with_t(self, x, tval, *args, **kwargs):
+    def forward_with_t(self, x, tval, image_name=None, *args, **kwargs):
         b, device, img_size, = x.shape[0], x.device, self.image_size
         check_shape(x, 'b c f h w', c = self.channels, f = self.num_frames, h = img_size, w = img_size)
         t = torch.full((b,), tval, device=device).long()
         x = normalize_img(x)
-        return self.p_losses(x, t, *args, **kwargs)
+        return self.p_losses(x, t, image_name=image_name, *args, **kwargs)
 
 # trainer class
 
@@ -1039,35 +1050,41 @@ class Trainer(object):
         t_min,
         t_max,
         t_step,
-        steps_per_t,
-        log_file='t_eval.json',
+        images=False,
+        log_file='t_eval.csv',
         prob_focus_present = 0.,
-        focus_present_mask
+        focus_present_mask = None
     ):
+        with open(log_file, 'w', newline='') as csvfile:
+            print("cleared the file")
+
         for tval in range(t_min,t_max,t_step):
             loss_list=[]
-            for step in range(0, steps_per_t):
-                torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
 
-                #[Foster] ignore any corrupted batches.
-                data = None
-                while(data == None):
-                    data = next(self.dl)
-                data = data.cuda()
+            #[Foster] ignore any corrupted batches.
+            data = None
+            while(data == None):
+                data = next(self.dl)
+            data = data.cuda()
 
-                with autocast('cuda', enabled = self.amp):
-                    loss = self.model.forward_with_t(
-                        data,
-                        tval,
-                        prob_focus_present = prob_focus_present,
-                        focus_present_mask = focus_present_mask
-                    )
+            image_name=None
+            if images:
+                image_name=f"samples/sample-t{tval}"
 
-                print(f't:{tval} step:{step}: {loss.item()}')
-                loss_list.append(loss.item())
-            with open(log_file, 'wa', newline='') as csvfile:
+            with autocast('cuda', enabled = self.amp):
+                loss = self.model.forward_with_t(
+                    data,
+                    tval,
+                    image_name=image_name,
+                    prob_focus_present = prob_focus_present,
+                    focus_present_mask = focus_present_mask
+                )
+                self.scaler.scale(loss/self.gradient_accumulate_every).backward()
+            print(f't:{tval}: {loss.item()}')
+            with open(log_file, 'a', newline='') as csvfile:
                 writer=csv.writer(csvfile)
-                writer.write_row([tval] + loss_list)
+                writer.writerow([tval, loss.item()])
 
 
 
